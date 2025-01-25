@@ -1,0 +1,490 @@
+---
+title: "CMM Bioinformatics Hub: DNA methylation Practical exercises"
+author: "Maria Needhamsen"
+output: html_document
+date: "2025-01-24"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+## Samples
+During the practical exercises we will work with a dataset generated within our group to study on- and off-target effects of four epigenetic editing tools, referred to as 3a, 3a3a, 3a3l and CRISPRoff. They are based on CRISPR-dCas9 technology, tested in HEK293 cells and designed to target the BACH2 promoter with g8, whereas NTC is a non-targeting control guide RNA. Samples were processed on EPIC, Infinium DNA methylation arrays from Illumina, which profiles ~850K DNA methylation sites genome-wide. 
+
+## Computational steps
+First, we will import, QC and preprocess the data, which includes the following steps:    
+- 1. Check probe intensities using the minfi package    
+- 2. Probe filter using the ChAMP package    
+- 3. Normalization using the NOOB funcNorm tool       
+- 4. Exploratory analysis using density, MDS, PCA and hierarchical     clustering plots
+
+Next, we will explore on- and off-target effects by:   
+- 5. Conducting differential methylation analysis using Limma
+- 6. Visualizing results with an interactive volcanoplot using Glimma   
+- 7. Visualizing the on-target region (BACH2) using the gviz package     
+
+## Be aware
+There is no "gold standard" pipeline for DNA methylation analysis and no method that necessarily fits all purposes/data. Hence, it is very important understand the details behind different tools, conduct thorough QC and exploratory analysis. As indicated by the long list of packages below, there has been a lot of tools developed in the field by the research community (there is no commercial software from Illumina). 
+
+## Packages
+Install and load the following packages (if you do not have these packages installed, simply run *install.packages(nameOfPackage)*) or BiocManager::install(nameOfPackage).
+
+```{r load packages, message=FALSE, cache=TRUE}
+devtools::install_github("hhhh5/ewastools@master")
+library("minfi")
+library("readxl")
+library("IlluminaHumanMethylationEPICmanifest")
+library("ChAMP")
+library("DMRcate")
+library("DMRcatedata")
+library("ewastools")
+library("stringi")
+library("data.table")
+library("magrittr")   
+library("purrr")
+library("RColorBrewer")
+library("FactoMineR")
+library("corrplot")
+library("limma")
+library("Gviz")
+library("Glimma")
+library("IlluminaHumanMethylationEPICanno.ilm10b4.hg19")
+library("widgetframe")
+```
+
+## Load raw idat files, normalize and extract DNA methylation values
+
+The raw EPIC data is in idat format with ".Red.idat" and ".Grn.idat" extensions. We will use the minfi package to read the data. 
+```{r read data, message=FALSE, cache=TRUE}
+#Set data directory
+data_dir <- "/Volumes/marnee/Private/teaching/BioinformaticsHub"
+
+#Read raw idat files
+rgSet <- read.metharray.exp(base=data_dir, extended = TRUE, force = force) 
+
+#Add probe annotation
+rgSet@annotation <- c(array = "IlluminaHumanMethylationEPIC", annotation = "ilm10b4.hg19")
+
+#Extract raw DNA methylation levels
+mset <- preprocessRaw(rgSet)
+beta_raw = getBeta(mset)
+
+#Normalize between and within arrays using the NOOB and funcNorm tools
+mset_Noob_FuncNorm <- preprocessFunnorm(rgSet)
+beta_Noob_FuncNorm = getBeta(mset_Noob_FuncNorm)
+```
+
+##  Data format
+Each row in the data contains DNA methylation levels of different sites. The columns refer to the different samples
+
+```{r data format}
+#Number of profiled probes and samples 
+dim(beta_Noob_FuncNorm)
+#View of the data
+head(beta_Noob_FuncNorm)
+```
+
+## Probe filter
+The EPIC DNA methylation array contains many probes that should be filtered prior to downstream analysis due to different reasons such as:   
+- 1. Noise/signal ratio (detection Pvalue)       
+- 2. Bead number    
+- 3. Non-CpG sites: especially important in DMR analysis  
+- 4. Probes overlapping with SNVs: user-defined MAF threshold and distance
+- 5. Ambiguous/cross-reactive probes   
+- 6. Probes capturing sex chromosomes: especially important in cross-sectional cohorts with mixed sex samples   
+
+```{r bead filter function, include = FALSE}
+mybeadcount <- function(x)
+{
+  #select out bead count dataframe
+  getNBeads(x) -> nb
+  #match rownames of beadcount dataframe to addresses
+  getProbeInfo(x,type="I")->typeIadd
+  match(typeIadd$AddressA,rownames(nb))->typeImatchA
+  match(typeIadd$AddressB,rownames(nb))->typeImatchB
+  
+  #match rownames of beadcount dataframe to addresses
+  getProbeInfo(x,type="II")->typeIIadd
+  match(typeIIadd$Address,rownames(nb))->typeIImatch
+  
+  nb->nbcg
+  
+  locusNames <- getManifestInfo(x, "locusNames")
+  bc_temp <- matrix(NA_real_, ncol = ncol(x), nrow = length(locusNames),
+                    dimnames = list(locusNames, sampleNames(x)))
+  
+  TypeII.Name <- getProbeInfo(x, type = "II")$Name
+  bc_temp[TypeII.Name, ] <- nbcg[getProbeInfo(x, type = "II")$AddressA,]
+  
+  TypeI <- getProbeInfo(x, type = "I")
+  
+  bc_temp->bcB
+  bc_temp->bcA        
+  
+  bcB[TypeI$Name, ] <- nbcg[TypeI$AddressB,]
+  bcA[TypeI$Name, ] <- nbcg[TypeI$AddressA,]
+  
+  which(bcB<3) -> bcB3
+  which(bcA<3) -> bcA3
+  bcA->bcA2
+  bcB->bcB2
+  bcA2[bcA3]<-NA
+  bcA2[bcB3]<-NA
+  
+  data.frame(bcA2)->bc
+  bc
+}
+```
+
+```{r probe filter, cache = TRUE, warning = F, message = F}
+#Detection Pvalue (>0.01)
+detP <- minfi::detectionP(rgSet)
+mset.f = mset[rowSums(detP <= 0.01)>0,]
+#Calculate the number of probes removed:
+dim(mset)[1]-dim(mset.f)[1]
+
+#Bead filter >3 beads. Import/run the mybeadcount function (mybeadcount.txt)
+beadCutoff=0.05
+bc = mybeadcount(rgSet)
+bc2 = bc[rowSums(is.na(bc)) < beadCutoff * (ncol(bc)), ]
+mset.f2 = mset.f[featureNames(mset.f) %in% row.names(bc2), ]
+#Calculate the number of probes removed: 
+dim(mset.f)[1] - dim(mset.f2)[1]
+
+##Filter of non-CpGs
+mset.f3 = dropMethylationLoci(mset.f2, dropCH = T)
+#Calculate the number of probes removed: 
+dim(mset.f2)[1] - dim(mset.f3)[1]
+
+#Filter probes overlapping with SNVs, ambigous/cross-reactivity probes and sex chromosomes
+tmp <- beta_Noob_FuncNorm[rownames(beta_Noob_FuncNorm) %in% featureNames(mset.f3), ]
+include <- rownames(rmSNPandCH(tmp, dist = 5, mafcut = 0.05, and = TRUE, rmcrosshyb = TRUE, rmXY=TRUE))
+mset.f4 = mset.f3[featureNames(mset.f3) %in% include,]
+#Calculate the number of probes removed:
+dim(mset.f3)[1] - dim(mset.f4)[1]
+
+#Calculate the number of probes (and samples) passing the filtering criteria
+dim(mset.f4)
+
+#Remove filtered probes from the normalized data
+mset_Noob_FuncNorm_filtred <- mset_Noob_FuncNorm[rownames(mset_Noob_FuncNorm) %in% rownames(mset.f4),]
+
+#Extract DNA methylation levels from the normalized data
+beta_Noob_FuncNorm_filtred <- getBeta(mset_Noob_FuncNorm_filtred)
+```
+
+## Quality control
+There are various QC steps to consider when processing DNA methylation data. A nice initial overview is to plot median intensities for the methylated and unmethylated probes
+
+```{r QC intensity, message=FALSE, cache=TRUE}
+#Median signal intensity. An arbitrary threshold suggests which samples pass
+qc <- getQC(mset.f4)
+plotQC(qc)
+#Conclusion: all samples pass. The median intensity already suggests that the samples behave quite differently in terms of global DNA methylation levels
+
+#Extensive QC report based on control probes (written as a PDF) 
+qcReport(rgSet, sampNames = NULL, sampGroups = NULL, pdf = "qcReport_minfi.pdf",
+         maxSamplesPerPage = 6, controls = c("BISULFITE CONVERSION I",
+                                             "BISULFITE CONVERSION II", 
+                                             "EXTENSION",
+                                             "HYBRIDIZATION",
+                                             "NON-POLYMORPHIC", 
+                                             "SPECIFICITY I", 
+                                             "SPECIFICITY II", 
+                                             "TARGET REMOVAL"))
+```
+
+## QC - check for sample mix-up
+Never underestimate the risk of sample mix-up! This can happen at many stages: sampling, extraction, processing etc. A simple first check is to predict the sex based on probes capturing the X and Y chromosomes and subsequently compare with the listed information (Be aware: there can also be mistakes in the meta-data).
+
+```{r sex prediction, cache = TRUE, warning = F, message = F}
+#Extract genome information to subsequently extract sex chromosomes
+GMset.f3 <- mapToGenome(mset.f3)
+estSex <- getSex(GMset.f3)
+estSex
+#Conclusion: all samples are predicted as female -> good start
+```
+
+The EPIC DNA methylation array contains 59 probes for SNV calling, which can be useful for example in a paired design. In this particular study all data are derived from the same cell line -> all samples should be predicted as the same individual
+```{r SNV prediction, cache = TRUE, warning = F, message = F}
+snps <- getSnpBeta(rgSet)
+genotypes = call_genotypes(snps,learn=FALSE)
+enumerate_sample_donors(genotypes)
+#Conclusion: All samples are predicted as the same individual -> very good
+```
+
+## Read the meta-data
+
+```{r read metadata, message=FALSE, cache=TRUE}
+#Read the meta-data file
+metaData <- read_excel("/Volumes/marnee/Private/teaching/BioinformaticsHub/MetaData_modified.xlsx")
+
+#Ensure the order of the meta data is the same as the data - classic mistake!!!
+metaData_ordered <- metaData[match(colnames(genotypes$snps), paste(metaData$`Sentrix Barcode`, metaData$`Sample Section`, sep="_")),]
+
+#View the meta-data
+metaData_ordered
+```
+
+Meta-data explained:  
+Construct: refers to the different epigenetic editing tools. Dead (d)DNMT3a is a negative control.  
+gRNA: refers to which guide RNA was used. g8 is designed to target the BACH2 promoter (on-target), whereas the NTC is a negative control with no homology to the human genome.  
+Sentrix Barcode: refers to the slide, where 8 samples can be loaded.  
+Sample Section: refers to the slide position
+
+# Exploratory analysis
+## Density plots
+A common first step in DNA methylation analysis is to check the distribution of DNA methylation levels in a density plot. The vast majority of sites in CpG-context are methylated across the genome, which will give a high peak around 100%. However, the DNA methylation arrays are designed to capture a larger proportion of promoter regions and CpG islands (CGIs) compared to the representative human genome, so the distribution is commonly bimodal with a peak around 0% as well. 
+
+```{r density plots, message=FALSE, cache=TRUE}
+#Plot density 
+#For the raw data
+densityPlot(mset.f4, sampGroups = metaData_ordered$Construct, brewer.pal(8, "Dark2"), main="Raw", ylim=c(0,10), xlab="")
+#For the normalized data
+densityPlot(beta_Noob_FuncNorm_filtred, sampGroups = metaData_ordered$Construct, brewer.pal(8, "Dark2"), main="Normalized", ylim=c(0,10), xlab="")
+```
+
+## Comments 
+- It was somewhat surprising how much the normalization changed the distribution of the samples. Why did this happen? Because the distribution was very different from the beginning. Hence, this is a classical example of how important it is to understand the underlying methodology and to double check as different tools/methods can change the data and ultimately the conclusions! 
+
+- Based on the density plots (and median intensities above), we can already start getting an idea about the level of off-target effects generated by the constructs.
+
+- Question: which constructs seem to have less off-target effect (Hint: which are closer to the dDNMT3a construct)?
+
+- Observation: the shoulder in the high DNA methylation peak disappears after normalization. That's due to type I and type II probe normalization
+
+## MDS (multi-dimensional scaling) 
+- Based on the 10 000 most variable positions
+- Named according to the construct
+- Color-coded according to the guide RNA
+
+```{r mds plots, message=FALSE, cache=TRUE}
+#For the raw data
+beta_raw_filtred = getBeta(mset.f4)
+mdsPlot(beta_raw_filtred, numPositions = 10000, sampNames = metaData_ordered$Construct, sampGroups = metaData_ordered$gRNA, xlim =c(-35,35), ylim=c(-35,35), pch = 1, pal = brewer.pal(8, "Dark2"), legendPos = "topright", main = NULL)
+
+#For the normalized data
+mdsPlot(beta_Noob_FuncNorm_filtred, numPositions = 10000, sampNames = metaData_ordered$Construct, sampGroups = metaData_ordered$gRNA, xlim =c(-35,35), ylim=c(-35,35), pch = 1, pal = brewer.pal(8, "Dark2"), legendPos = "topright", main = NULL)
+```
+
+## Hierachical clustering 
+```{r hierachical clustering, message=FALSE, cache=TRUE}
+#For the raw data
+colnames(beta_raw_filtred) <- metaData_ordered$Construct_gRNA
+hc.raw.filtred <- hclust(dist(t(beta_raw_filtred)))
+dend.raw.filtred <- as.dendrogram(hc.raw.filtred)
+par(mar = c(7, 3, 2, 2))
+plot(dend.raw.filtred, center = TRUE)
+
+#For the normalized data
+colnames(beta_Noob_FuncNorm_filtred) <- metaData_ordered$Construct_gRNA
+hc <- hclust(dist(t(beta_Noob_FuncNorm_filtred)))
+dend <- as.dendrogram(hc)
+par(mar = c(7, 3, 2, 2))
+plot(dend, center = TRUE)
+```
+
+## Conclusion
+Taken together, from the density plots, MDS and hierachical clustering we now know that the Noob funcNorm-based normalization changes the overall DNA methylation levels of the samples -> going forward we will use the raw data. Since we are only exploring differential DNA methylation at single site (not regions), it is not necessary to account for the type I/II probe bias. Possibly, we could have explored other normalization methods, but we will rest our peace for now and continue..:)   
+
+## Principal component analysis
+We will use PCA to help understand where the main variation within our data is coming from, i.e whether it's from the constructs or the guide RNAs (although we already have an idea about that from the previous exploratory analysis)
+
+```{r PCA, message=FALSE, cache=TRUE}
+#PCA
+prcomb <- FactoMineR::PCA(t(beta_raw_filtred), graph = FALSE, ncp=10)
+
+#Plot the percentage of variance explained by each PC
+plot(1:nrow(prcomb$eig), prcomb$eig[,3] , type="l" , ylim=c(0,100), lwd=3,main="",xlab="PC",ylab="Variance Explained")
+
+#PC vs covariate association analysis. We will now associate each PC with variables of interest, which in this case is construct and guide RNAs. This is also a possibility to check potential technical covariates, such as batch effects
+PC.vs.covariate <-matrix(NA,2,ncol=length(prcomb$eig[,3]))
+rownames(PC.vs.covariate)<-c("Construct","gRNA")
+
+for (i in 1:length(prcomb$eig[,3])) {
+  PC.vs.covariate["Construct",i] <- kruskal.test(as.numeric(prcomb$ind$coord[,i])  ~ as.factor(metaData_ordered$Construct))$p.value
+  PC.vs.covariate["gRNA",i] <- kruskal.test(as.numeric(prcomb$ind$coord[,i])  ~ as.factor(metaData_ordered$gRNA))$p.value}
+
+colnames(PC.vs.covariate)<-paste("PC",1:length(prcomb$eig[,3]), sep="")
+corrplot(PC.vs.covariate, is.corr = F, method="shade", addCoef.col=T, main="", mar=c(0,0,1,0))
+```
+
+## Conclusion:
+The majority of the variation is coming from the constructs, but the type of gRNAs also seem to have an effect. 
+
+## Differential DNA methylation analysis
+We are of course interested to explore the on- and off-target effects statistically. Since we only have one sample per condition, we in downstream analyses assign 3a, 3a3a and 3a3l constructs into one group as they were the most similar in the exploratory analysis, but still keep CRISPRoff and dDNMT3a samples for plotting. We will constrast g8vsNTC.   
+
+```{r Differential DNA methylation analysis, message=FALSE, cache=TRUE}
+#Filter the data 
+beta_raw_filtred2 <- beta_raw_filtred[,!metaData_ordered$Construct=="dDNMT3a" & !metaData_ordered$Construct=="CRISPR-Off"]
+#Filter the meta-data
+metaData_ordered2 <- metaData_ordered[!metaData_ordered$Construct=="dDNMT3a" & !metaData_ordered$Construct=="CRISPR-Off",]
+
+#set up the model
+design = model.matrix(~0 + as.factor(metaData_ordered2$gRNA))
+colnames(design) <- c("g8","NTC")
+#View the model matrix
+head(design)
+
+#Since the variation between the constructs is not of interest in this particular question, rather the difference between g8 and NTC, we set construct as a random effect by assigning it as a blocking variable in the lmFit function in Limma. Before doing this, we first estimate the correlation using the duplicationCorrelation function. Please note this steps takes a relatively long time to run. Alternatively, the listed cor$consensus.correlation value can be added directly into the lmFit function.
+
+cor <- duplicateCorrelation(beta_raw_filtred2, design, block=as.factor(metaData_ordered2$Construct))
+#> cor$consensus.correlation
+#[1] 0.4389374
+
+#Fit the model
+fit <- lmFit(object=beta_raw_filtred2, design=design, block=metaData_ordered2$Construct, correlation=cor$consensus.correlation)
+
+#Make and apply the contrast matrix. Consider and take note of the direction, i.e. g8-NTC: a positive effect size means up in g8, a negative value means down.
+cont.matrix <- makeContrasts(g8.vs.NTC=g8-NTC, levels=design)
+contrasts.fit <- contrasts.fit(fit, cont.matrix)
+
+#The empirical Bayes method shrinks the probe-wise sample variances towards a common value to augment the degrees of freedom for the individual variances (Smyth, 2004)
+contrasts.fit <- eBayes(contrasts.fit)
+
+#Check number of significant sites after correcting for multiple testing
+results <- decideTests(contrasts.fit, method="global")
+summary(results)
+
+#Extract summary statistics
+topTable <- topTable(contrasts.fit, coef="g8.vs.NTC", number=Inf)
+head(topTable)
+```
+
+## Conclusions
+Athough no hits pass the significance threshold after correction for multiple testing, there are still sites with relatively low Pvalues -> we will explore further 
+
+## Interactive volcanoplots
+Volcanoplots are a great way to get an overview of the analysis output as the -log10(Pvalue) is plotted against the effect size, in this case the DNA methylation difference between g8 and NTC. In the table the effect size is referred to as logFC, but that is because the glimma package is originally designed for RNAseq analysis, where the count data is commonly log transformed. Hence, without the log-transformation, the logFC just refers to the difference (delta) DNA methylation.  
+
+As the cg-probeID is not very informative by itself, we merge additional annotation, such as gene names and genomic features, with the summary statistics  
+```{r Volcanoplots, message=FALSE, cache=TRUE}
+
+#Extract gene name and genomic feature from the Illumina manifest, which is available as an r package
+data("IlluminaHumanMethylationEPICanno.ilm10b4.hg19")
+annoObj = as.data.frame(getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19))[,c("Name", "UCSC_RefGene_Name", "UCSC_RefGene_Group")]
+rownames(annoObj) <- annoObj$Name
+
+#Extract top 1000 hits
+top_cgs <- rownames(head(topTable, n=1000))
+
+#Add CRIPRoff, i.e only keep the dDNMT3a sample separate for the plotting 
+metaData_ordered$group <- ifelse(metaData_ordered$Construct=="dDNMT3a", "dDNMT3a", metaData_ordered$gRNA)
+
+Vol_topCGs <- glimmaVolcano(contrasts.fit[top_cgs,], 
+                   dge = NULL,
+                   counts = beta_raw_filtred[top_cgs,],
+                   transform.counts="none", 
+                   coef="g8.vs.NTC", 
+                   anno=annoObj[top_cgs,],
+                   groups=metaData_ordered$group, 
+                   main = "topCGs")
+#Save the interactive volcanoplot as an html file
+htmlwidgets::saveWidget(Vol_topCGs, file="top1000_NTC.vs.g8.html")
+frameWidget(Vol_topCGs)
+
+#Extract BACH2 probes to check them separately
+bach2_cgs <- rownames(annoObj[grepl("BACH2", annoObj$UCSC_RefGene_Name),])
+bach2_cgs <- rownames(contrasts.fit[rownames(contrasts.fit) %in% bach2_cgs,])
+
+Vol_bach2 <- glimmaVolcano(contrasts.fit[bach2_cgs,], 
+                   dge = NULL,
+                   counts = beta_raw_filtred[bach2_cgs,],
+                   transform.counts="none", 
+                   coef="g8.vs.NTC", 
+                   anno=annoObj[bach2_cgs,],
+                   groups=metaData_ordered$group, 
+                   main = "BACH2_CGs")
+#Save the interactive volcanoplot as an html file
+htmlwidgets::saveWidget(Vol_bach2, file="BACH2_NTC.vs.g8.html")
+frameWidget(Vol_bach2)
+```
+
+## Visualization of the BACH2 promoter
+For this we use the Gviz package (https://bioconductor.org/packages/devel/bioc/vignettes/Gviz/inst/doc/Gviz.html), where it's also possible to add custom tracks
+
+```{r BACH visualization, message=FALSE, cache=TRUE}
+#Assign genomic region
+genome <- "hg19"
+chr="chr6"
+start <- 90000000
+end <- 92378049
+minbase <- start - 0.25 * (end - start)
+maxbase <- end + 0.25 * (end - start)
+
+#Assign color
+pal <- c("black", "blue","red")
+
+#Tracks available through Gviz
+iTrack <- IdeogramTrack(genome = genome, 
+                        chromosome = "6", 
+                        name = "Chromosome 6")
+
+gTrack <- GenomeAxisTrack(col = "black", 
+                          cex = 1, 
+                          name = "", 
+                          fontcolor = "black",
+                          chromosome = "6")
+
+#Gene track from RefSeq
+rTrack <- UcscTrack(genome = genome, 
+                    chromosome = "6", 
+                    track = "NCBI RefSeq",
+                    table="ncbiRefSeqCurated",
+                    from = start,
+                    to = end, 
+                    trackType = "GeneRegionTrack",
+                    rstarts = "exonStarts", 
+                    rends = "exonEnds", 
+                    gene = "name",
+                    symbol = "name2", 
+                    transcript = "name",
+                    strand = "strand",
+                    fill = "darkblue",
+                    stacking = "squish", 
+                    name = "RefSeq",
+                    showId = TRUE, 
+                    geneSymbol = TRUE)
+
+#DNA Methylation track
+#First we add the genomic coordinates and then convert to a grange object
+GRset <- makeGenomicRatioSetFromMatrix(beta_raw_filtred, what="Beta", array = "IlluminaHumanMethylationEPIC", annotation = "ilm10b4.hg19")
+gr <- granges(GRset)
+gr$beta <- getBeta(GRset)
+
+#We chose the top BACH2 CpG in the TSS1500 category for visualization
+methTrack <- DataTrack(range = gr["cg16897634",],
+                       groups = metaData_ordered$group,
+                       genome = genome,
+                       chromosome = "6", 
+                       ylim = c(-0.05, 1.05), 
+                       col = pal,
+                       type = "boxplot", 
+                       box.width=10,
+                       name = "DNA Methylation (%)",
+                       background.panel = "white", 
+                       legend = TRUE, 
+                       cex.title = 0.8,
+                       cex.axis = 0.8, 
+                       cex.legend = 0.8,
+                       cex=0.4)
+
+#Combine the tracks into a list
+tracks <- list(iTrack, gTrack, methTrack, rTrack)
+#Set up the relative sizes of the tracks
+sizes <- c(1, 2, 6, 1) 
+
+#Plot the tracks
+plotTracks(tracks, 
+           from = 90600000, 
+           to = 91100000, 
+           showTitle = TRUE, 
+           add53 = TRUE,
+           add35 = TRUE, 
+           grid = TRUE, 
+           lty.grid = 3, 
+           sizes = sizes, 
+           length(tracks))
+```
